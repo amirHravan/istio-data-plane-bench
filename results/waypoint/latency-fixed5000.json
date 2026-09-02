@@ -1,0 +1,57 @@
+{
+  "metadata": {
+    "name": "knb-latency-146003",
+    "generator": "knb-latency",
+    "version": "1.0.0",
+    "date": "2026-09-02 08:53:43",
+    "server-node": "g9-56core-1229",
+    "client-node": "g9-56core-1227",
+    "duration": "20"
+  },
+  "data": {
+    "cpu": "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+    "kernel": "5.15.0-160-generic",
+    "k8s-version": "v1.31.1",
+    "mtu": "1500",
+    "http-p2p": {
+      "test": "http",
+      "target": "p2p",
+      "mean_us": "610.2",
+      "p50_us": "568.1",
+      "p75_us": "670.7",
+      "p90_us": "776.9",
+      "p99_us": "1385.7",
+      "p99_9_us": "5909.1",
+      "min_us": "230.4",
+      "max_us": "16418.9",
+      "stddev_us": "401.7",
+      "rate": "4999.6",
+      "errors": "0",
+      "calls": "100000",
+      "client_cpu": "21.34",
+      "client_ram": "127061",
+      "server_cpu": "20.86",
+      "server_ram": "135712"
+    },
+    "http-p2s": {
+      "test": "http",
+      "target": "p2s",
+      "mean_us": "1650.9",
+      "p50_us": "1613.0",
+      "p75_us": "1819.8",
+      "p90_us": "2059.8",
+      "p99_us": "2928.8",
+      "p99_9_us": "8283.3",
+      "min_us": "507.5",
+      "max_us": "209186.5",
+      "stddev_us": "1047.0",
+      "rate": "4998.6",
+      "errors": "0",
+      "calls": "100000",
+      "client_cpu": "22.61",
+      "client_ram": "127935",
+      "server_cpu": "20.52",
+      "server_ram": "135787"
+    }
+  }
+}

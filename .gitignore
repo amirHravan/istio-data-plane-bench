@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Misc
+*.tmp
+run-all.log
+k8s-bench-suite/run-all.log
+gen-report.py

@@ -1,0 +1,1107 @@
+#!/bin/bash
+###################################################################
+# @Description : Kubernetes Network Latency Benchmark
+#                Inspired by knb (bandwidth), this measures
+#                dataplane latency (netperf) and service-path
+#                HTTP latency (fortio) across service mesh modes.
+# @License     : MIT
+###################################################################
+
+#==============================================================================
+# Utility functions
+#==============================================================================
+
+[ "$(tput colors)" -gt 0 ] && COLOR="true" || COLOR="false"
+function color {
+	$COLOR || return 0
+	color="0"
+	case $1 in
+		normal) color="0" ;;
+		rst) color="0" ;;
+		red) color="31" ;;
+		green) color="32" ;;
+		yellow) color="33" ;;
+		blue) color="34" ;;
+		magenta) color="35" ;;
+		cyan) color="36" ;;
+		lightred) color="91" ;;
+		lightgreen) color="92" ;;
+		lightyellow) color="93" ;;
+		lightblue) color="94" ;;
+		lightmagenta) color="95" ;;
+		lightcyan) color="96" ;;
+		white) color="97" ;;
+		*) color="0" ;;
+	esac
+	echo -e "\033[0;${color}m"
+}
+function logdate { date "+%Y-%m-%d %H:%M:%S"; }
+function fatal { echo "$(logdate) $(color red)[FATAL]$(color normal) $@" >&2; cleanandexit 1; }
+function err { echo "$(logdate) $(color lightred)[ERROR]$(color normal) $@" >&2; }
+function warn { [ $DEBUG_LEVEL -ge 1 ] && echo "$(logdate) $(color yellow)[WARNING]$(color normal) $@" >&2; }
+function info { [ $DEBUG_LEVEL -ge 2 ] && echo "$(logdate) $(color cyan)[INFO]$(color normal) $@" >&2; }
+function debug { [ $DEBUG_LEVEL -ge 3 ] && echo "$(logdate) $(color lightcyan)[DEBUG]$(color normal) $@" >&2; }
+
+function now { date +%s; }
+
+# Emits the imagePullSecrets YAML block (sibling of containers) when a secret is set
+function image-pull-secrets-block {
+	if [ -n "$IMAGE_PULL_SECRET" ]
+	then
+		printf '  imagePullSecrets:\n  - name: %s\n' "$IMAGE_PULL_SECRET"
+	fi
+}
+function cleanandexit {
+	for i in $RESOURCE_TO_CLEAN_BEFORE_EXIT
+	do
+		$DEBUG && debug "Deleting resource $i"
+		$KUBECTL delete $NAMESPACEOPT $i --wait=false >/dev/null 2>/dev/null
+	done
+
+	if [ "$CLEANDIR" = "true" ]
+	then
+		[ ! -z "$DATADIR" ] && [ -d $DATADIR ] && touch $DATADIR/something && rm $DATADIR/* && rmdir $DATADIR
+	else
+		info "Keeping data directory, you will have to clean it manually."
+		info "$DATADIR"
+	fi
+
+	exit ${1:-0}
+}
+
+function waitpod {
+	POD=$1
+	PHASE=$2
+	TIMEOUT=$3
+	TMAX=$(( $(now) + $TIMEOUT ))
+	$DEBUG && debug "Waiting for pod $POD to be $PHASE until $TMAX"
+	while [ "$(now)" -lt "$TMAX" ]
+	do
+		CURRENTPHASE=$($KUBECTL get --request-timeout 15s $NAMESPACEOPT pod $POD -o jsonpath={.status.phase} 2>/dev/null)
+		$DEBUG && debug "[$(now)/$TMAX] Pod $POD is in phase $CURRENTPHASE, waiting for $PHASE"
+		[ "$CURRENTPHASE" = "$PHASE" ] && return 0
+		sleep 1
+	done
+	return 1
+}
+
+function detect-pod-failure-reason-and-fatal {
+	POD_NAME=$1
+	shift
+
+	CURRENTPHASE=$($KUBECTL get --request-timeout 15s $NAMESPACEOPT pod $POD_NAME -o jsonpath={.status.phase} 2>/dev/null)
+	$DEBUG && debug "Trying to detect pod failure for pod '$POD_NAME' in phase '$CURRENTPHASE'"
+	case $CURRENTPHASE in
+		"Pending")
+			err "Pod $POD_NAME is still in Pending state, please check node name"
+			;;
+		"Failed")
+			$KUBECTL logs $NAMESPACEOPT $POD_NAME >&2
+			;;
+		*)
+			err "Unknown pod phase '$CURRENTPHASE' for pod '$POD_NAME'"
+			;;
+	esac
+
+	fatal $@
+}
+
+#==============================================================================
+# Default config
+#==============================================================================
+
+VERSION=1.0.0
+GENERATOR="knb-latency"
+BENCHMARK_DATE=$(date -u "+%Y-%m-%d %H:%M:%S")
+DEBUG=false
+DEBUG_LEVEL=0
+SERVER_NODE=""
+CLIENT_NODE=""
+EXECID="$$"
+BENCHMARK_RUN_NAME="knb-latency-$EXECID"
+NAMESPACEOPT=""
+POD_WAIT_TIMEOUT="30"
+BENCHMARK_DURATION="60"
+OUTPUT_FORMAT="text"
+FILENAME="/dev/stdout"
+CLEANDIR="true"
+DATA_DIR=""
+
+NETPERF_IMAGE="${NETPERF_IMAGE:-knb-netperf:latest}"
+FORTIO_IMAGE="${FORTIO_IMAGE:-fortio/fortio:1.75.2}"
+MONITOR_IMAGE="${MONITOR_IMAGE:-infrabuilder/bench-custom-monitor}"
+IMAGE_PULL_SECRET="${IMAGE_PULL_SECRET:-reg-pegah-credit}"
+KUBECTL="kubectl"
+
+NETPERF_REQ_SIZE="1"
+NETPERF_RESP_SIZE="1"
+FORTIO_CONNS="16"
+FORTIO_QPS="0"
+FORTIO_RESOLUTION="0.00001"
+FORTIO_HTTP_SIZE="0"
+FORTIO_BW_SIZE="${FORTIO_BW_SIZE:-65536}"
+
+RUN_TEST_TCP_RR="true"
+RUN_TEST_TCP_CRR="true"
+RUN_TEST_HTTP_P2P="true"
+RUN_TEST_HTTP_P2S="true"
+RUN_TEST_HTTP_BW="true"
+
+# netperf omni output selectors (order is fixed, parsed by position)
+NETPERF_OMNI="MEAN_LATENCY,P50_LATENCY,P90_LATENCY,P99_LATENCY,MIN_LATENCY,MAX_LATENCY,STDDEV_LATENCY,THROUGHPUT,LOCAL_TRANSPORT_RETRANS,REMOTE_TRANSPORT_RETRANS"
+
+export LC_ALL=C
+BIN_AWK="awk"
+
+#==============================================================================
+# Result file helpers (each test writes key=value lines to $DATADIR/<pod>.result)
+#==============================================================================
+
+function write-result-file {
+	RESULT_FILE=$1
+	shift
+	: > "$RESULT_FILE"
+	while [ "$#" -gt 0 ]
+	do
+		echo "$1" >> "$RESULT_FILE"
+		shift
+	done
+}
+
+# Append cpu/ram metrics from the monitor pods to a result file
+function append-monitor-metrics {
+	POD_NAME=$1
+	STARTTIME=$2
+	ENDTIME=$3
+
+	$KUBECTL exec -i $NAMESPACEOPT $MONITOR_SERVER_POD_NAME \
+		-- sh /stats.sh $STARTTIME $ENDTIME > $DATADIR/$POD_NAME-server.metrics 2>/dev/null
+
+	tail -n +2 $DATADIR/$POD_NAME-server.metrics | LC_ALL=C $BIN_AWK '{M+=$6;U+=$1;N+=$2;S+=$3;I+=$4;T+=$5;}
+		END { printf "%.2f %.2f %.2f %.2f %.2f %d\n",U/NR,N/NR,S/NR,I/NR,T/NR,M/NR }' > $DATADIR/$POD_NAME-server.avg
+
+	$KUBECTL exec -i $NAMESPACEOPT $MONITOR_CLIENT_POD_NAME \
+		-- sh /stats.sh $STARTTIME $ENDTIME > $DATADIR/$POD_NAME-client.metrics 2>/dev/null
+
+	tail -n +2 $DATADIR/$POD_NAME-client.metrics | LC_ALL=C $BIN_AWK '{M+=$6;U+=$1;N+=$2;S+=$3;I+=$4;T+=$5;}
+		END { printf "%.2f %.2f %.2f %.2f %.2f %d\n",U/NR,N/NR,S/NR,I/NR,T/NR,M/NR }' > $DATADIR/$POD_NAME-client.avg
+
+	SERVER_AVG=$(cat $DATADIR/$POD_NAME-server.avg)
+	CLIENT_AVG=$(cat $DATADIR/$POD_NAME-client.avg)
+
+	SERVER_CPU=$($BIN_AWK '{printf "%.2f",$1+$2+$3+$4+$5}' <<< "$SERVER_AVG")
+	SERVER_RAM=$($BIN_AWK '{print $6}' <<< "$SERVER_AVG")
+	CLIENT_CPU=$($BIN_AWK '{printf "%.2f",$1+$2+$3+$4+$5}' <<< "$CLIENT_AVG")
+	CLIENT_RAM=$($BIN_AWK '{print $6}' <<< "$CLIENT_AVG")
+
+	echo "client_cpu=$CLIENT_CPU" >> $DATADIR/$POD_NAME.result
+	echo "client_ram=$CLIENT_RAM" >> $DATADIR/$POD_NAME.result
+	echo "server_cpu=$SERVER_CPU" >> $DATADIR/$POD_NAME.result
+	echo "server_ram=$SERVER_RAM" >> $DATADIR/$POD_NAME.result
+}
+
+function timed-sleep-and-wait {
+	POD_NAME=$1
+	STARTTIME=$(now)
+	ENDTIME=$(( $STARTTIME + $BENCHMARK_DURATION + 5 ))
+	$DEBUG && debug "sleeping during the benchmark duration ($BENCHMARK_DURATION) to avoid useless api calls"
+	sleep $BENCHMARK_DURATION
+	info "Waiting for pod $POD_NAME to be completed"
+	waitpod $POD_NAME Succeeded $POD_WAIT_TIMEOUT
+}
+
+# Write a zero/error result file so a failed test does not abort the whole run
+function write-error-result {
+	POD_NAME=$1
+	TEST_SLUG=$2
+	TARGET_TYPE=$3
+	write-result-file $DATADIR/$POD_NAME.result \
+		"test=$TEST_SLUG" \
+		"target=$TARGET_TYPE" \
+		"error=1" \
+		"mean_us=0" \
+		"p50_us=0" \
+		"p90_us=0" \
+		"p99_us=0" \
+		"min_us=0" \
+		"max_us=0" \
+		"stddev_us=0" \
+		"rate=0"
+}
+
+# Capture pod logs + describe before a test is recorded as failed, so the
+# failure mode is auditable from the raw data instead of being lost.
+function capture-failure-log {
+	POD_NAME=$1
+	$KUBECTL logs $NAMESPACEOPT $POD_NAME > $DATADIR/$POD_NAME.log 2>/dev/null || true
+	$KUBECTL describe pod $NAMESPACEOPT $POD_NAME > $DATADIR/$POD_NAME.describe 2>/dev/null || true
+}
+
+#==============================================================================
+# Test runners
+#==============================================================================
+
+function run-netperf-client {
+	POD_NAME=$1
+	TARGET=$2
+	NETTEST=$3
+	TEST_SLUG=$4
+
+	CMD="netperf -H $TARGET -t $NETTEST -l $BENCHMARK_DURATION -- -r $NETPERF_REQ_SIZE,$NETPERF_RESP_SIZE -o $NETPERF_OMNI"
+
+	info "Starting pod $POD_NAME on node $CLIENT_NODE"
+	cat <<-EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create pod $POD_NAME"
+	apiVersion: v1
+	kind: Pod
+	metadata:
+	  labels:
+	    app: $POD_NAME
+	  name: $POD_NAME
+	spec:
+	$(image-pull-secrets-block)
+	  containers:
+	  - name: netperf
+	    image: $NETPERF_IMAGE
+	    args:
+	    - /bin/sh
+	    - -c
+	    - "$CMD"
+	  nodeSelector:
+	    kubernetes.io/hostname: $CLIENT_NODE
+	  restartPolicy: Never
+	EOF
+
+	RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$POD_NAME"
+
+	$KUBECTL wait $NAMESPACEOPT --for=condition=Ready pod/$POD_NAME \
+		--timeout=${POD_WAIT_TIMEOUT}s >/dev/null 2>/dev/null
+	if [ $? -ne 0 ]
+	then
+		err "Test $POD_NAME failed to start, skipping (netperf $NETTEST)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME $TEST_SLUG p2p
+		return
+	fi
+
+	timed-sleep-and-wait $POD_NAME || {
+		err "Test $POD_NAME did not complete, recording as error (netperf $NETTEST)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME $TEST_SLUG p2p
+		return
+	}
+
+	$DEBUG && debug "Writing $POD_NAME logs to $DATADIR/$POD_NAME.log"
+	$KUBECTL logs $NAMESPACEOPT $POD_NAME > $DATADIR/$POD_NAME.log 2>/dev/null
+
+	LINE=$($BIN_AWK '/Mean Latency/{getline; print; exit}' $DATADIR/$POD_NAME.log | tr -d '\r')
+	$DEBUG && debug "$POD_NAME omni line = $LINE"
+
+	MEAN=$(echo "$LINE"    | $BIN_AWK -F, '{print $1}')
+	P50=$(echo "$LINE"     | $BIN_AWK -F, '{print $2}')
+	P90=$(echo "$LINE"     | $BIN_AWK -F, '{print $3}')
+	P99=$(echo "$LINE"     | $BIN_AWK -F, '{print $4}')
+	MIN=$(echo "$LINE"     | $BIN_AWK -F, '{print $5}')
+	MAX=$(echo "$LINE"     | $BIN_AWK -F, '{print $6}')
+	STDDEV=$(echo "$LINE"  | $BIN_AWK -F, '{print $7}')
+	RATE=$(echo "$LINE"    | $BIN_AWK -F, '{print $8}')
+	RETRANS_L=$(echo "$LINE" | $BIN_AWK -F, '{print $9}')
+	RETRANS_R=$(echo "$LINE" | $BIN_AWK -F, '{print $10}')
+
+	# A zero/empty throughput means the run transferred nothing (e.g. netperf
+	# through an Envoy sidecar with mTLS). Record it as an error, not 0 µs.
+	if [ -z "$LINE" ] || [ "$RATE" = "" ] || [ "$RATE" = "0" ] || [ "$RATE" = "0.00" ]
+	then
+		err "Test $POD_NAME produced no transactions (netperf $NETTEST), recording as error"
+		write-error-result $POD_NAME $TEST_SLUG p2p
+		return
+	fi
+
+	write-result-file $DATADIR/$POD_NAME.result \
+		"test=$TEST_SLUG" \
+		"target=p2p" \
+		"mean_us=$MEAN" \
+		"p50_us=$P50" \
+		"p90_us=$P90" \
+		"p99_us=$P99" \
+		"min_us=$MIN" \
+		"max_us=$MAX" \
+		"stddev_us=$STDDEV" \
+		"rate=$RATE" \
+		"retrans_local=$RETRANS_L" \
+		"retrans_remote=$RETRANS_R"
+
+	append-monitor-metrics $POD_NAME $STARTTIME $ENDTIME
+}
+
+function run-fortio-client {
+	POD_NAME=$1
+	TARGET=$2
+	TARGET_TYPE=$3
+
+	if [ "$FORTIO_HTTP_SIZE" != "0" ] && [ "$FORTIO_HTTP_SIZE" != "" ]
+	then
+		URL="http://$TARGET:8080/echo?size=$FORTIO_HTTP_SIZE"
+	else
+		URL="http://$TARGET:8080/echo"
+	fi
+
+	info "Starting pod $POD_NAME on node $CLIENT_NODE"
+	cat <<-EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create pod $POD_NAME"
+	apiVersion: v1
+	kind: Pod
+	metadata:
+	  labels:
+	    app: $POD_NAME
+	  name: $POD_NAME
+	spec:
+	$(image-pull-secrets-block)
+	  containers:
+	  - name: fortio
+	    image: $FORTIO_IMAGE
+	    args:
+	    - load
+	    - -qps
+	    - "$FORTIO_QPS"
+	    - -c
+	    - "$FORTIO_CONNS"
+	    - -r
+	    - "$FORTIO_RESOLUTION"
+	    - -t
+	    - "${BENCHMARK_DURATION}s"
+	    - "$URL"
+	  nodeSelector:
+	    kubernetes.io/hostname: $CLIENT_NODE
+	  restartPolicy: Never
+	EOF
+
+	RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$POD_NAME"
+
+	$KUBECTL wait $NAMESPACEOPT --for=condition=Ready pod/$POD_NAME \
+		--timeout=${POD_WAIT_TIMEOUT}s >/dev/null 2>/dev/null
+	if [ $? -ne 0 ]
+	then
+		err "Test $POD_NAME failed to start, skipping (fortio $TARGET_TYPE)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME http $TARGET_TYPE
+		return
+	fi
+
+	timed-sleep-and-wait $POD_NAME || {
+		err "Test $POD_NAME did not complete, recording as error (fortio $TARGET_TYPE)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME http $TARGET_TYPE
+		return
+	}
+
+	$DEBUG && debug "Writing $POD_NAME logs to $DATADIR/$POD_NAME.log"
+	$KUBECTL logs $NAMESPACEOPT $POD_NAME > $DATADIR/$POD_NAME.log 2>/dev/null
+
+	AGG=$(grep "Aggregated Function Time :" $DATADIR/$POD_NAME.log)
+	MEAN=$(echo "$AGG" | $BIN_AWK '{print $8}')
+	MIN=$(echo "$AGG"  | $BIN_AWK '{print $12}')
+	MAX=$(echo "$AGG"  | $BIN_AWK '{print $14}')
+	STDDEV=$(echo "$AGG" | $BIN_AWK '{print $10}')
+	CALLS=$(echo "$AGG" | $BIN_AWK '{print $6}')
+	# Percentiles are scoped to the "Aggregated Function Time" histogram block;
+	# at fixed QPS fortio also emits an "Aggregated Sleep Time" block first.
+	P50=$(awk '/Aggregated Function Time :/{f=1} /Connection time histogram/{f=0} f && $2=="target" && $3=="50%" {print $4}' $DATADIR/$POD_NAME.log)
+	P75=$(awk '/Aggregated Function Time :/{f=1} /Connection time histogram/{f=0} f && $2=="target" && $3=="75%" {print $4}' $DATADIR/$POD_NAME.log)
+	P90=$(awk '/Aggregated Function Time :/{f=1} /Connection time histogram/{f=0} f && $2=="target" && $3=="90%" {print $4}' $DATADIR/$POD_NAME.log)
+	P99=$(awk '/Aggregated Function Time :/{f=1} /Connection time histogram/{f=0} f && $2=="target" && $3=="99%" {print $4}' $DATADIR/$POD_NAME.log)
+	P999=$(awk '/Aggregated Function Time :/{f=1} /Connection time histogram/{f=0} f && $2=="target" && $3=="99.9%" {print $4}' $DATADIR/$POD_NAME.log)
+	QPS=$(grep "All done" $DATADIR/$POD_NAME.log | grep -oE '[0-9.]+ qps' | $BIN_AWK '{print $1}')
+
+	if grep -q "Error cases : no data" $DATADIR/$POD_NAME.log
+	then
+		ERRORS=0
+	else
+		ERRORS=1
+	fi
+
+	# fortio reports seconds -> convert to microseconds
+	MEAN_US=$(echo "$MEAN" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	MIN_US=$(echo "$MIN" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	MAX_US=$(echo "$MAX" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	STDDEV_US=$(echo "$STDDEV" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	P50_US=$(echo "$P50" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	P75_US=$(echo "$P75" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	P90_US=$(echo "$P90" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	P99_US=$(echo "$P99" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+	P999_US=$(echo "$P999" | $BIN_AWK '{printf "%.1f", $1*1e6}')
+
+	write-result-file $DATADIR/$POD_NAME.result \
+		"test=http" \
+		"target=$TARGET_TYPE" \
+		"mean_us=$MEAN_US" \
+		"p50_us=$P50_US" \
+		"p75_us=$P75_US" \
+		"p90_us=$P90_US" \
+		"p99_us=$P99_US" \
+		"p99_9_us=$P999_US" \
+		"min_us=$MIN_US" \
+		"max_us=$MAX_US" \
+		"stddev_us=$STDDEV_US" \
+		"rate=$QPS" \
+		"errors=$ERRORS" \
+		"calls=$CALLS"
+
+	append-monitor-metrics $POD_NAME $STARTTIME $ENDTIME
+}
+
+# HTTP bandwidth test: fortio with a large response payload, at max QPS.
+# Measures Mbit/s through the mesh (pod2svc). This is the only bandwidth
+# metric that works through an Envoy STRICT-mTLS sidecar (iperf3/netperf
+# use split/reverse data connections that STRICT mTLS cannot route).
+function run-fortio-bw-client {
+	POD_NAME=$1
+	TARGET=$2
+
+	URL="http://$TARGET:8080/echo?size=$FORTIO_BW_SIZE"
+
+	info "Starting pod $POD_NAME on node $CLIENT_NODE"
+	cat <<-EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create pod $POD_NAME"
+	apiVersion: v1
+	kind: Pod
+	metadata:
+	  labels:
+	    app: $POD_NAME
+	  name: $POD_NAME
+	spec:
+	$(image-pull-secrets-block)
+	  containers:
+	  - name: fortio
+	    image: $FORTIO_IMAGE
+	    args:
+	    - load
+	    - -qps
+	    - "0"
+	    - -c
+	    - "$FORTIO_CONNS"
+	    - -t
+	    - "${BENCHMARK_DURATION}s"
+	    - "$URL"
+	  nodeSelector:
+	    kubernetes.io/hostname: $CLIENT_NODE
+	  restartPolicy: Never
+	EOF
+
+	RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$POD_NAME"
+
+	$KUBECTL wait $NAMESPACEOPT --for=condition=Ready pod/$POD_NAME \
+		--timeout=${POD_WAIT_TIMEOUT}s >/dev/null 2>/dev/null
+	if [ $? -ne 0 ]
+	then
+		err "Test $POD_NAME failed to start, skipping (fortio httpbw)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME httpbw p2s
+		return
+	fi
+
+	timed-sleep-and-wait $POD_NAME || {
+		err "Test $POD_NAME did not complete, recording as error (fortio httpbw)"
+		capture-failure-log $POD_NAME
+		write-error-result $POD_NAME httpbw p2s
+		return
+	}
+
+	$DEBUG && debug "Writing $POD_NAME logs to $DATADIR/$POD_NAME.log"
+	$KUBECTL logs $NAMESPACEOPT $POD_NAME > $DATADIR/$POD_NAME.log 2>/dev/null
+
+	# total response bytes (last field after "sum")
+	TOTAL_BYTES=$(grep "Response Body/Total Sizes" $DATADIR/$POD_NAME.log \
+		| $BIN_AWK '{for(i=1;i<=NF;i++) if($i=="sum") print $(i+1)}')
+	QPS=$(grep "All done" $DATADIR/$POD_NAME.log | grep -oE '[0-9.]+ qps' | $BIN_AWK '{print $1}')
+	CALLS=$(grep "All done" $DATADIR/$POD_NAME.log | $BIN_AWK '{print $3}')
+
+	# Mbit/s = total_bytes * 8 / duration / 1e6
+	BW_MBPS=$(echo "$TOTAL_BYTES" | $BIN_AWK -v d="$BENCHMARK_DURATION" '{printf "%.1f", $1 * 8 / d / 1000000}')
+
+	write-result-file $DATADIR/$POD_NAME.result \
+		"test=httpbw" \
+		"target=p2s" \
+		"bw_mbps=$BW_MBPS" \
+		"bw_size=$FORTIO_BW_SIZE" \
+		"rate=$QPS" \
+		"calls=$CALLS"
+
+	append-monitor-metrics $POD_NAME $STARTTIME $ENDTIME
+}
+
+#==============================================================================
+# Report
+#==============================================================================
+
+function compute-json-result {
+	echo "{"
+	echo "  \"metadata\": {"
+	echo "    \"name\": \"$BENCHMARK_RUN_NAME\","
+	echo "    \"generator\": \"$GENERATOR\","
+	echo "    \"version\": \"$VERSION\","
+	echo "    \"date\": \"$BENCHMARK_DATE\","
+	echo "    \"server-node\": \"$SERVER_NODE\","
+	echo "    \"client-node\": \"$CLIENT_NODE\","
+	echo "    \"duration\": \"$BENCHMARK_DURATION\""
+	echo "  },"
+	echo "  \"data\": {"
+	echo "    \"cpu\": $([ -s $DATADIR/cpu ] && cat $DATADIR/cpu | jq -R . || echo '""'),"
+	echo "    \"kernel\": $([ -s $DATADIR/kernel ] && cat $DATADIR/kernel | jq -R . || echo '""'),"
+	echo "    \"k8s-version\": $([ -s $DATADIR/k8s-version ] && cat $DATADIR/k8s-version | jq -R . || echo '""'),"
+	echo "    \"mtu\": $([ -s $DATADIR/mtu ] && cat $DATADIR/mtu | jq -R . || echo '""'),"
+	FIRST=true
+	for POD_NAME in $TEST_PODS
+	do
+		TEST=$(grep '^test=' $DATADIR/$POD_NAME.result | cut -d= -f2)
+		TARGET=$(grep '^target=' $DATADIR/$POD_NAME.result | cut -d= -f2)
+		LABEL="${TEST}-${TARGET}"
+		$FIRST && FIRST=false || echo ","
+		echo "    \"$LABEL\": {"
+		LINE_FIRST=true
+		while IFS='=' read -r K V
+		do
+			[ -z "$K" ] && continue
+			$LINE_FIRST && LINE_FIRST=false || echo ","
+			printf "      \"%s\": %s" "$K" "$(echo "$V" | jq -R .)"
+		done < $DATADIR/$POD_NAME.result
+		echo ""
+		echo -n "    }"
+	done
+	echo ""
+	echo "  }"
+	echo "}"
+}
+
+function compute-text-result {
+	echo "========================================================="
+	echo " Latency Benchmark Results"
+	echo "========================================================="
+	echo " Name            : $BENCHMARK_RUN_NAME"
+	echo " Date            : $BENCHMARK_DATE UTC"
+	echo " Generator       : $GENERATOR"
+	echo " Version         : $VERSION"
+	echo " Server          : $SERVER_NODE"
+	echo " Client          : $CLIENT_NODE"
+	echo " Duration        : ${BENCHMARK_DURATION}s"
+	echo "========================================================="
+	echo "  Discovered CPU         : $(cat $DATADIR/cpu 2>/dev/null)"
+	echo "  Discovered Kernel      : $(cat $DATADIR/kernel 2>/dev/null)"
+	echo "  Discovered k8s version : $(cat $DATADIR/k8s-version 2>/dev/null)"
+	echo "  Discovered MTU         : $(cat $DATADIR/mtu 2>/dev/null)"
+	for POD_NAME in $TEST_PODS
+	do
+		TEST=$(grep '^test=' $DATADIR/$POD_NAME.result | cut -d= -f2)
+		TARGET=$(grep '^target=' $DATADIR/$POD_NAME.result | cut -d= -f2)
+		echo "  ${TEST}-${TARGET} :"
+		while IFS='=' read -r K V
+		do
+			[ -z "$K" ] && continue
+			echo "    $K = $V"
+		done < $DATADIR/$POD_NAME.result
+		echo ""
+	done
+	echo "========================================================="
+}
+
+function generate-report {
+	case $OUTPUT_FORMAT in
+		json) compute-json-result > $FILENAME ;;
+		text) compute-text-result > $FILENAME ;;
+		*)    compute-text-result > $FILENAME ;;
+	esac
+}
+
+#==============================================================================
+# Usage
+#==============================================================================
+
+function usage {
+	cat <<-EOF
+
+	knb-latency : Kubernetes dataplane latency benchmark (netperf + fortio)
+
+	Mandatory flags :
+	    -cn <nodename> / --client-node <nodename> : node hosting the client pods
+	    -sn <nodename> / --server-node <nodename> : node hosting the server pods
+
+	Optionnal flags :
+	    -d <sec>     / --duration <sec>     : test duration (Default ${BENCHMARK_DURATION})
+	    -n <ns>      / --namespace <ns>     : target namespace
+	    --name <name>                        : benchmark run name
+	    -ot <list>   / --only-tests <list>   : comma separated test subset
+	                                           Values: all, tcprr, tcpcrr, http, httpbw, p2p, p2s
+	    -r <req,resp>                        : netperf request/response size (Default ${NETPERF_REQ_SIZE},${NETPERF_RESP_SIZE})
+	    -c <n>                               : fortio concurrency (Default ${FORTIO_CONNS})
+	    --qps <n>                            : fortio target qps, 0 = unlimited (Default ${FORTIO_QPS})
+	    --resolution <sec>                   : fortio histogram resolution (Default ${FORTIO_RESOLUTION})
+	    -b <bytes>                           : fortio http response body size (Default ${FORTIO_HTTP_SIZE})
+	    --bw-size <bytes>                    : fortio bandwidth payload size (Default ${FORTIO_BW_SIZE})
+	    -t <sec>     / --timeout <sec>       : pod ready wait timeout (Default ${POD_WAIT_TIMEOUT})
+	    -o <format>  / --output <format>     : text|json (Default text)
+	    -f <file>    / --file <file>         : output file (Default stdout)
+	    --data-dir <dir>                     : keep raw data (logs, metrics) in <dir>
+	    -k           / --keep                : keep the temp raw data directory
+	    --context <name>                     : kubectl context (e.g. stg)
+	    --debug, -v                          : verbose/debug
+	    -h / --help                          : this help
+
+	Tests:
+	    tcprr   : netperf TCP_RR  pod2pod (per-request latency, established conn)
+	    tcpcrr  : netperf TCP_CRR pod2pod (connect + request + response)
+	    http    : fortio HTTP     pod2pod + pod2svc (p50/p75/p90/p99)
+	    httpbw  : fortio HTTP     pod2svc, large payload, max QPS (Mbit/s)
+
+	Note: pod2svc uses fortio (HTTP) because netperf opens a separate data
+	      connection that bypasses the kube-proxy Service VIP (and would skip
+	      the L7 waypoint in ambient mode).
+	EOF
+}
+
+#==============================================================================
+# Argument parsing
+#==============================================================================
+
+[ "$1" = "" ] && usage && exit
+
+UNKNOWN_ARGLIST=""
+while [ "$1" != "" ]
+do
+	arg=$1
+	case $arg in
+		--server-node|-sn)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			SERVER_NODE=$1
+			info "Server node will be '$SERVER_NODE'"
+			;;
+		--client-node|-cn)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			CLIENT_NODE=$1
+			info "Client node will be '$CLIENT_NODE'"
+			;;
+		--duration|-d)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			BENCHMARK_DURATION="$1"
+			info "Setting benchmark duration to ${1}s"
+			;;
+		--namespace|-n)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			NAMESPACEOPT="--namespace $1"
+			info "Setting target namespace to '$1'"
+			;;
+		--name)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			BENCHMARK_RUN_NAME="$1"
+			info "Setting benchmark run name to '$1'"
+			;;
+		--only-tests|-ot)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+
+			RUN_TEST_TCP_RR="false"
+			RUN_TEST_TCP_CRR="false"
+			RUN_TEST_HTTP_P2P="false"
+			RUN_TEST_HTTP_P2S="false"
+			RUN_TEST_HTTP_BW="false"
+
+			for i in $($BIN_AWK '{gsub(/,/," ");print}' <<< "$1")
+			do
+				case $i in
+					all)
+						RUN_TEST_TCP_RR="true"
+						RUN_TEST_TCP_CRR="true"
+						RUN_TEST_HTTP_P2P="true"
+						RUN_TEST_HTTP_P2S="true"
+						RUN_TEST_HTTP_BW="true"
+						;;
+					tcprr) RUN_TEST_TCP_RR="true" ;;
+					tcpcrr) RUN_TEST_TCP_CRR="true" ;;
+					http)
+						RUN_TEST_HTTP_P2P="true"
+						RUN_TEST_HTTP_P2S="true"
+						;;
+					httpbw) RUN_TEST_HTTP_BW="true" ;;
+					p2p)
+						RUN_TEST_TCP_RR="true"
+						RUN_TEST_TCP_CRR="true"
+						RUN_TEST_HTTP_P2P="true"
+						;;
+					p2s) RUN_TEST_HTTP_P2S="true" ;;
+					*) fatal "Unknown test slug '${i}'" ;;
+				esac
+			done
+			info "Benchmark will run only following tests: ${1}"
+			;;
+		-r)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			NETPERF_REQ_SIZE="${1%%,*}"
+			NETPERF_RESP_SIZE="${1##*,}"
+			info "Setting netperf request/response size to ${NETPERF_REQ_SIZE}/${NETPERF_RESP_SIZE}"
+			;;
+		-c)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FORTIO_CONNS="$1"
+			info "Setting fortio concurrency to ${1}"
+			;;
+		--qps)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FORTIO_QPS="$1"
+			info "Setting fortio qps to ${1}"
+			;;
+		--resolution)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FORTIO_RESOLUTION="$1"
+			info "Setting fortio histogram resolution to ${1}"
+			;;
+		-b)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FORTIO_HTTP_SIZE="$1"
+			info "Setting fortio http response body size to ${1}"
+			;;
+		--bw-size)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FORTIO_BW_SIZE="$1"
+			info "Setting fortio bandwidth payload size to ${1}"
+			;;
+		--timeout|-t)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			POD_WAIT_TIMEOUT="$1"
+			info "Setting pod wait timeout to ${1}s"
+			;;
+		--output|-o)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			case $1 in
+				json) ;;
+				text) ;;
+				*) fatal "Unknown output format '$1'. Possible values: text, json" ;;
+			esac
+			OUTPUT_FORMAT="$1"
+			info "Setting output format to ${1}"
+			;;
+		--file|-f)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			FILENAME="$1"
+			[ "$FILENAME" = "-" ] && FILENAME="/dev/stdout"
+			info "Output file set to ${FILENAME}"
+			;;
+		--data-dir)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			DATA_DIR="$1"
+			CLEANDIR="false"
+			info "Raw data directory set to ${1}"
+			;;
+		--keep|-k)
+			CLEANDIR="false"
+			info "Keeping raw data directory after run"
+			;;
+		--context)
+			shift
+			[ "$1" = "" ] && fatal "$arg flag must be followed by a value"
+			KUBECTL="kubectl --context $1"
+			info "Using kubectl context '$1'"
+			;;
+		--debug)
+			DEBUG_LEVEL=3
+			DEBUG=true
+			debug "Mode debug ON"
+			;;
+		--verbose|-v)
+			DEBUG_LEVEL=2
+			;;
+		--help|-h)
+			usage && exit
+			;;
+		--version|-V)
+			echo "$VERSION"
+			exit
+			;;
+		*) UNKNOWN_ARGLIST="$UNKNOWN_ARGLIST $arg" ;;
+	esac
+	shift
+done
+
+[ "$UNKNOWN_ARGLIST" != "" ] && fatal "Unknown arguments : $UNKNOWN_ARGLIST"
+$DEBUG && debug "Argument parsing done"
+
+#==============================================================================
+# Preflight checks
+#==============================================================================
+
+[ "$SERVER_NODE" = "" -o "$CLIENT_NODE" = "" ] \
+	&& fatal "Both client node and server node must be set (--server-node and --client-node)"
+
+[ -x "$(which jq)" ] || fatal "jq is required (used to parse fortio json output)"
+
+#==============================================================================
+# Preparation
+#==============================================================================
+
+DATADIR="$(mktemp -d)"
+if [ "$DATA_DIR" != "" ]
+then
+	DATADIR="$DATA_DIR"
+	mkdir -p "$DATADIR"
+	info "Using raw data directory $DATADIR"
+fi
+
+MONITOR_SERVER_POD_NAME="knb-lat-monitor-server-$EXECID"
+MONITOR_CLIENT_POD_NAME="knb-lat-monitor-client-$EXECID"
+NETSERVER_POD_NAME="knb-lat-netserver-$EXECID"
+FORTIO_SERVER_POD_NAME="knb-lat-fortio-server-$EXECID"
+FORTIO_SERVICE_NAME=$FORTIO_SERVER_POD_NAME
+
+CLIENT_TCP_RR_POD_NAME=""
+CLIENT_TCP_CRR_POD_NAME=""
+CLIENT_HTTP_P2P_POD_NAME=""
+CLIENT_HTTP_P2S_POD_NAME=""
+CLIENT_HTTP_BW_POD_NAME=""
+
+TEST_PODS=""
+
+$RUN_TEST_TCP_RR    && CLIENT_TCP_RR_POD_NAME="knb-lat-client-tcprr-$EXECID"     && TEST_PODS="$TEST_PODS $CLIENT_TCP_RR_POD_NAME"
+$RUN_TEST_TCP_CRR   && CLIENT_TCP_CRR_POD_NAME="knb-lat-client-tcpcrr-$EXECID"   && TEST_PODS="$TEST_PODS $CLIENT_TCP_CRR_POD_NAME"
+$RUN_TEST_HTTP_P2P  && CLIENT_HTTP_P2P_POD_NAME="knb-lat-client-http-p2p-$EXECID" && TEST_PODS="$TEST_PODS $CLIENT_HTTP_P2P_POD_NAME"
+$RUN_TEST_HTTP_P2S  && CLIENT_HTTP_P2S_POD_NAME="knb-lat-client-http-p2s-$EXECID" && TEST_PODS="$TEST_PODS $CLIENT_HTTP_P2S_POD_NAME"
+$RUN_TEST_HTTP_BW   && CLIENT_HTTP_BW_POD_NAME="knb-lat-client-httpbw-$EXECID"    && TEST_PODS="$TEST_PODS $CLIENT_HTTP_BW_POD_NAME"
+
+cat <<EOF > $DATADIR/env
+BENCHMARK_RUN_NAME="$BENCHMARK_RUN_NAME"
+GENERATOR="$GENERATOR"
+VERSION="$VERSION"
+BENCHMARK_DATE="$BENCHMARK_DATE"
+SERVER_NODE="$SERVER_NODE"
+CLIENT_NODE="$CLIENT_NODE"
+BENCHMARK_DURATION="$BENCHMARK_DURATION"
+EOF
+
+trap ctrl_c INT TERM
+function ctrl_c {
+	err "Trapped signal, trying to exit gracefully ..."
+	cleanandexit 130
+}
+
+#==============================================================================
+# Starting monitors
+#==============================================================================
+
+info "Deploying server monitor on node $SERVER_NODE"
+cat <<EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create server monitor pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: $MONITOR_SERVER_POD_NAME
+  name: $MONITOR_SERVER_POD_NAME
+spec:
+$(image-pull-secrets-block)
+  containers:
+  - name: monitor
+    image: $MONITOR_IMAGE
+  nodeSelector:
+    kubernetes.io/hostname: $SERVER_NODE
+EOF
+
+RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$MONITOR_SERVER_POD_NAME"
+
+info "Waiting for server monitor to be running"
+waitpod $MONITOR_SERVER_POD_NAME Running $POD_WAIT_TIMEOUT \
+	|| detect-pod-failure-reason-and-fatal $MONITOR_SERVER_POD_NAME "Failed to start server monitor pod"
+
+info "Deploying client monitor on node $CLIENT_NODE"
+cat <<EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create client monitor pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: $MONITOR_CLIENT_POD_NAME
+  name: $MONITOR_CLIENT_POD_NAME
+spec:
+$(image-pull-secrets-block)
+  containers:
+  - name: monitor
+    image: $MONITOR_IMAGE
+  nodeSelector:
+    kubernetes.io/hostname: $CLIENT_NODE
+EOF
+
+RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$MONITOR_CLIENT_POD_NAME"
+
+info "Waiting for client monitor to be running"
+waitpod $MONITOR_CLIENT_POD_NAME Running $POD_WAIT_TIMEOUT \
+	|| detect-pod-failure-reason-and-fatal $MONITOR_CLIENT_POD_NAME "Failed to start client monitor pod"
+
+#==============================================================================
+# Starting servers
+#==============================================================================
+
+if [ "$CLIENT_TCP_RR_POD_NAME" != "" ] || [ "$CLIENT_TCP_CRR_POD_NAME" != "" ]
+then
+	info "Deploying netserver on node $SERVER_NODE"
+	cat <<EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create netserver pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: $NETSERVER_POD_NAME
+  name: $NETSERVER_POD_NAME
+spec:
+$(image-pull-secrets-block)
+  containers:
+  - name: netserver
+    image: $NETPERF_IMAGE
+    args:
+    - server
+  nodeSelector:
+    kubernetes.io/hostname: $SERVER_NODE
+EOF
+
+	RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$NETSERVER_POD_NAME"
+
+	info "Waiting for netserver to be running"
+	$KUBECTL wait $NAMESPACEOPT --for=condition=Ready pod/$NETSERVER_POD_NAME \
+		--timeout=${POD_WAIT_TIMEOUT}s >/dev/null \
+		|| detect-pod-failure-reason-and-fatal $NETSERVER_POD_NAME "Failed to start netserver pod"
+
+	NETSERVER_IP=$($KUBECTL get $NAMESPACEOPT pod $NETSERVER_POD_NAME -o jsonpath={.status.podIP})
+	$DEBUG && debug "Netserver IP address is $NETSERVER_IP"
+fi
+
+if [ "$CLIENT_HTTP_P2P_POD_NAME" != "" ] || [ "$CLIENT_HTTP_P2S_POD_NAME" != "" ] || [ "$CLIENT_HTTP_BW_POD_NAME" != "" ]
+then
+	info "Deploying fortio server on node $SERVER_NODE"
+	cat <<EOF | $KUBECTL apply $NAMESPACEOPT -f - >/dev/null || fatal "Cannot create fortio server pod"
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: $FORTIO_SERVER_POD_NAME
+  name: $FORTIO_SERVER_POD_NAME
+spec:
+$(image-pull-secrets-block)
+  containers:
+  - name: fortio
+    image: $FORTIO_IMAGE
+    args:
+    - server
+  nodeSelector:
+    kubernetes.io/hostname: $SERVER_NODE
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $FORTIO_SERVICE_NAME
+spec:
+  selector:
+    app: $FORTIO_SERVER_POD_NAME
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+      name: http
+EOF
+
+	RESOURCE_TO_CLEAN_BEFORE_EXIT="$RESOURCE_TO_CLEAN_BEFORE_EXIT pod/$FORTIO_SERVER_POD_NAME svc/$FORTIO_SERVICE_NAME"
+
+	info "Waiting for fortio server to be running"
+	$KUBECTL wait $NAMESPACEOPT --for=condition=Ready pod/$FORTIO_SERVER_POD_NAME \
+		--timeout=${POD_WAIT_TIMEOUT}s >/dev/null \
+		|| detect-pod-failure-reason-and-fatal $FORTIO_SERVER_POD_NAME "Failed to start fortio server pod"
+
+	FORTIO_IP=$($KUBECTL get $NAMESPACEOPT pod $FORTIO_SERVER_POD_NAME -o jsonpath={.status.podIP})
+	$DEBUG && debug "Fortio server IP address is $FORTIO_IP"
+fi
+
+#==============================================================================
+# Data Detection
+#==============================================================================
+
+# Data detection uses the monitor pod (alpine-based, always deployed) so it
+# works regardless of which test images are in use (fortio is scratch).
+SERVER_POD_FOR_DETECT="$MONITOR_SERVER_POD_NAME"
+
+if [ "$SERVER_POD_FOR_DETECT" != "" ]
+then
+	info "Detecting CPU"
+	DISCOVERED_CPU=$($KUBECTL exec -i $NAMESPACEOPT $SERVER_POD_FOR_DETECT -- grep "model name" /proc/cpuinfo 2>/dev/null | tail -n 1 | $BIN_AWK -F: '{print $2}')
+	$DEBUG && debug "Cpu is $DISCOVERED_CPU"
+	echo $DISCOVERED_CPU > $DATADIR/cpu
+
+	info "Detecting Kernel"
+	DISCOVERED_KERNEL=$($KUBECTL exec -i $NAMESPACEOPT $SERVER_POD_FOR_DETECT -- uname -r 2>/dev/null)
+	$DEBUG && debug "Kernel is $DISCOVERED_KERNEL"
+	echo $DISCOVERED_KERNEL > $DATADIR/kernel
+
+	info "Detecting Kubernetes version"
+	DISCOVERED_K8S_VERSION=$($KUBECTL get --raw /version 2>/dev/null | jq -r '.gitVersion' 2>/dev/null || echo "unknown")
+	$DEBUG && debug "Discovered k8s version is $DISCOVERED_K8S_VERSION"
+	echo $DISCOVERED_K8S_VERSION > $DATADIR/k8s-version
+
+	info "Detecting CNI MTU"
+	CNI_MTU=$($KUBECTL exec -i $NAMESPACEOPT $SERVER_POD_FOR_DETECT -- cat /sys/class/net/eth0/mtu 2>/dev/null | head -1 | tr -d '\r\n')
+	$DEBUG && debug "CNI MTU is $CNI_MTU"
+	echo $CNI_MTU > $DATADIR/mtu
+fi
+
+#==============================================================================
+# Benchmark tests
+#==============================================================================
+
+if [ "$CLIENT_TCP_RR_POD_NAME" != "" ]
+then
+	run-netperf-client $CLIENT_TCP_RR_POD_NAME $NETSERVER_IP TCP_RR tcprr
+else
+	info "Skipping TCP_RR test"
+fi
+
+if [ "$CLIENT_TCP_CRR_POD_NAME" != "" ]
+then
+	run-netperf-client $CLIENT_TCP_CRR_POD_NAME $NETSERVER_IP TCP_CRR tcpcrr
+else
+	info "Skipping TCP_CRR test"
+fi
+
+if [ "$CLIENT_HTTP_P2P_POD_NAME" != "" ]
+then
+	run-fortio-client $CLIENT_HTTP_P2P_POD_NAME $FORTIO_IP p2p
+else
+	info "Skipping HTTP pod2pod test"
+fi
+
+if [ "$CLIENT_HTTP_P2S_POD_NAME" != "" ]
+then
+	run-fortio-client $CLIENT_HTTP_P2S_POD_NAME $FORTIO_SERVICE_NAME p2s
+else
+	info "Skipping HTTP pod2svc test"
+fi
+
+if [ "$CLIENT_HTTP_BW_POD_NAME" != "" ]
+then
+	run-fortio-bw-client $CLIENT_HTTP_BW_POD_NAME $FORTIO_SERVICE_NAME
+else
+	info "Skipping HTTP bandwidth test"
+fi
+
+#==============================================================================
+# Output
+#==============================================================================
+
+generate-report
+
+#==============================================================================
+# Cleaning
+#==============================================================================
+
+info "Cleaning kubernetes resources ..."
+cleanandexit

@@ -1,0 +1,44 @@
+# Benchmark namespaces and their Istio mesh configuration.
+#
+#   benchmark               — no mesh (baseline)
+#   benchmark-sidecar-nomtls — sidecar, mTLS DISABLE (see peerauthentication.yaml)
+#   benchmark-sidecar-mtls   — sidecar, mTLS STRICT (see peerauthentication.yaml)
+#   benchmark-ztunnel        — ambient, ztunnel (L4) only
+#   benchmark-waypoint       — ambient + L7 waypoint (enrolled by setup.sh)
+#
+# Note: Istio's default mTLS mode is PERMISSIVE, so a STRICT policy must be
+# applied explicitly — see peerauthentication.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: benchmark
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: benchmark-sidecar-nomtls
+  labels:
+    istio-injection: enabled
+    istio.io/rev: default
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: benchmark-sidecar-mtls
+  labels:
+    istio-injection: enabled
+    istio.io/rev: default
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: benchmark-ztunnel
+  labels:
+    istio.io/dataplane-mode: ambient
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: benchmark-waypoint
+  labels:
+    istio.io/dataplane-mode: ambient

@@ -1,0 +1,16 @@
+test=tcprr
+target=p2p
+mean_us=59.24
+p50_us=54
+p90_us=74
+p99_us=120
+min_us=41
+max_us=12145
+stddev_us=41.36
+rate=16854.55
+retrans_local=0
+retrans_remote=0
+client_cpu=19.85
+client_ram=125449
+server_cpu=19.22
+server_ram=135670

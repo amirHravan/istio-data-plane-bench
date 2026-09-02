@@ -1,0 +1,22 @@
+# Explicit mTLS policies for the two sidecar benchmark modes.
+#
+# Istio's mesh-wide default is PERMISSIVE — the "mTLS" benchmark mode is only
+# meaningful if a STRICT policy is actually applied. Without these, both
+# sidecar namespaces would run PERMISSIVE and the comparison would be wrong.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls
+  namespace: benchmark-sidecar-mtls
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: disable-mtls
+  namespace: benchmark-sidecar-nomtls
+spec:
+  mtls:
+    mode: DISABLE
