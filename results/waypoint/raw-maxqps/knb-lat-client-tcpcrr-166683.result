@@ -1,0 +1,16 @@
+test=tcpcrr
+target=p2p
+mean_us=692.38
+p50_us=675
+p90_us=802
+p99_us=1034
+min_us=518
+max_us=7587
+stddev_us=125.51
+rate=1443.81
+retrans_local=-1
+retrans_remote=-1
+client_cpu=12.11
+client_ram=130827
+server_cpu=20.91
+server_ram=137319

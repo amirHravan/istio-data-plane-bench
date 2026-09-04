@@ -60,27 +60,27 @@ Official docs: [sidecar mode](https://istio.io/latest/docs/setup/additional-setu
 
 ## Summary of findings
 
-| Test                                        | no mesh | sidecar no-mTLS | sidecar mTLS | ambient ztunnel | ambient waypoint |
-| ------------------------------------------- | ------- | --------------- | ------------ | --------------- | ---------------- |
-| HTTP latency, fixed 5000 qps (pod2svc, µs)  | ~224    | ~2703           | ~2899        | ~594            | ~1651            |
-| HTTP max throughput (pod2svc, req/s)        | ~91k    | ~6.6k           | ~6.2k        | ~34k            | ~11k             |
-| HTTP bandwidth, fortio (Mbit/s)             | ~7541   | ~2480           | ~2182        | ~4113           | ~2889            |
-| Bulk TCP bandwidth, iperf3 pod2svc (Mbit/s) | ~7662   | ~7062           | ~4742        | ~3568           | ~2357            |
-| Bulk TCP bandwidth, iperf3 pod2pod (Mbit/s) | ~7503   | ~7297           | n/a          | ~3664           | ~3681            |
-| Raw TCP_RR latency (pod2pod, µs)            | ~59     | ~190            | n/a          | ~208            | ~223             |
+| Test | no mesh | sidecar no-mTLS | sidecar mTLS | ambient ztunnel | ambient waypoint |
+|---|---|---|---|---|---|
+| HTTP latency, fixed 5000 qps (pod2svc, µs) | ~200 | ~2564 | ~2766 | ~557 | ~3082 |
+| HTTP max throughput (pod2svc, req/s) | ~99k | ~6.5k | ~6.2k | ~35k | ~5.3k |
+| HTTP bandwidth, fortio (Mbit/s) | ~7888 | ~2492 | ~1793 | ~4321 | ~1338 |
+| Bulk TCP bandwidth, iperf3 pod2svc (Mbit/s) | ~7694 | ~6501 | ~5187 | ~3790 | ~2469 |
+| Bulk TCP bandwidth, iperf3 pod2pod (Mbit/s) | ~7140 | ~6897 | n/a | ~3804 | ~3580 |
+| Raw TCP_RR latency (pod2pod, µs) | ~60 | ~178 | n/a | ~205 | ~197 |
 
 What this means in practice:
 
-1. **Request-oriented workloads (RPC, APIs) favor ambient.** On the Service path at fixed 5000 qps, ztunnel adds ~370 µs over baseline while a sidecar adds ~2.7 ms; ztunnel sustains ~5× more requests/sec and ~2× more HTTP bandwidth.
+1. **Request-oriented workloads (RPC, APIs) favor ztunnel.** On the Service path at fixed 5000 qps, ztunnel adds ~357 µs over baseline while a sidecar adds ~2.6 ms; ztunnel sustains ~5.6× more requests/sec and ~2.4× more HTTP bandwidth.
 2. **STRICT mTLS rejects pod2pod traffic.** The sidecar needs the destination's Service identity to do mTLS, so direct pod-IP connections fail (fortio returns 503; iperf3/netperf hang); only Service (pod2svc) traffic works under STRICT mTLS.
-3. **mTLS cost is real on the mean, larger on the tail.** Sidecar STRICT mTLS is ~7% slower than no-mTLS on the mean (2899 vs 2703 µs), but the fixed-QPS p99 is ~3× worse (15.1 ms vs 5.0 ms) — needs a repeat run to confirm it isn't single-sample noise.
-4. **Waypoint is the L7 half of ambient.** It adds a clear cost on the Service path (1651 µs vs ztunnel's 594 µs), while its pod2pod stays ztunnel-only — the waypoint only intercepts Service traffic.
-5. **Raw bulk TCP favors the sidecar, even under STRICT mTLS via the Service.** pod2pod iperf3 loses only ~3% with a DISABLE sidecar but ~51% with ztunnel; via the Service the STRICT-mTLS sidecar still keeps ~4742 Mbit/s vs ztunnel's ~3568 Mbit/s.
+3. **mTLS cost is real on the mean, larger on the tail.** Sidecar STRICT mTLS is ~8% slower than no-mTLS on the mean (2766 vs 2564 µs), but the fixed-QPS p99 is ~2.3× worse (11.0 ms vs 4.7 ms) — needs a repeat run to confirm it isn't single-sample noise.
+4. **A single-replica waypoint is the slowest on the Service path.** With the waypoint scaled to 1 instance (to match the sidecar's one-pod cost), pod2svc is 3082 µs — slower than the sidecar — because a lone cross-node L7 hop becomes the bottleneck. Its pod2pod stays ztunnel-only, confirming the waypoint only intercepts Service traffic.
+5. **Raw bulk TCP favors the sidecar, even under STRICT mTLS via the Service.** pod2pod iperf3 loses only ~3% with a DISABLE sidecar but ~47% with ztunnel; via the Service the STRICT-mTLS sidecar still keeps ~5187 Mbit/s vs ztunnel's ~3790 Mbit/s.
 
 Notes about the benchmark:
 
-1. You can't disable mtls on ambient mode.
-2. In ambient mode, the waypoint proxy is placed on some of the nodes, so for some of the pods and connections it might have locality, but kubernetes default RR load balancing will send some of the traffic to a waypoint on a different node, which adds latency. The benchmark does not try to control for that, but it is a real-world scenario.
+1. You can't disable mTLS on ambient mode.
+2. In ambient mode the waypoint proxy runs on a node of its own, so for some pods/connections it has locality but for others the L7 hop crosses nodes, adding latency. Here the waypoint is scaled to a single replica (to match the sidecar's one-pod-per-workload cost), so this effect is a single cross-node hop rather than load-balanced — a 3-replica HA waypoint behaves differently.
 
 ## Results
 

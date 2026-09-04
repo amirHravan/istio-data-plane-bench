@@ -1,11 +1,11 @@
 {
   "metadata": {
-    "name": "knb-latency-137551",
+    "name": "knb-latency-174702",
     "generator": "knb-latency",
     "version": "1.0.0",
-    "date": "2026-09-02 08:48:46",
+    "date": "2026-09-04 11:48:38",
     "server-node": "g9-56core-1229",
-    "client-node": "g9-56core-1227",
+    "client-node": "g9-56core-1228",
     "duration": "20"
   },
   "data": {
@@ -29,22 +29,22 @@
     "http-p2s": {
       "test": "http",
       "target": "p2s",
-      "mean_us": "2898.5",
-      "p50_us": "2644.2",
-      "p75_us": "3178.2",
-      "p90_us": "3681.8",
-      "p99_us": "15112.5",
-      "p99_9_us": "28419.8",
-      "min_us": "603.2",
-      "max_us": "214772.8",
-      "stddev_us": "2579.0",
-      "rate": "4998.9",
+      "mean_us": "2765.9",
+      "p50_us": "2592.1",
+      "p75_us": "3251.8",
+      "p90_us": "3770.8",
+      "p99_us": "11015.1",
+      "p99_9_us": "27379.5",
+      "min_us": "549.8",
+      "max_us": "208458.0",
+      "stddev_us": "1982.0",
+      "rate": "4999.1",
       "errors": "0",
       "calls": "100000",
-      "client_cpu": "27.61",
-      "client_ram": "128714",
-      "server_cpu": "23.93",
-      "server_ram": "136287"
+      "client_cpu": "18.83",
+      "client_ram": "130420",
+      "server_cpu": "23.43",
+      "server_ram": "137910"
     }
   }
 }

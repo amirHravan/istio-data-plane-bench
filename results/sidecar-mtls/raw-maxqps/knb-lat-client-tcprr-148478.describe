@@ -1,0 +1,223 @@
+Name:             knb-lat-client-tcprr-148478
+Namespace:        benchmark-sidecar-mtls
+Priority:         0
+Service Account:  default
+Node:             g9-56core-1228/172.16.14.22
+Start Time:       Fri, 04 Sep 2026 15:01:26 +0330
+Labels:           app=knb-lat-client-tcprr-148478
+                  networking.istio.io/tunnel=http
+                  security.istio.io/tlsMode=istio
+                  service.istio.io/canonical-name=knb-lat-client-tcprr-148478
+                  service.istio.io/canonical-revision=latest
+Annotations:      istio.io/rev: default
+                  kubectl.kubernetes.io/default-container: netperf
+                  kubectl.kubernetes.io/default-logs-container: netperf
+                  prometheus.io/path: /stats/prometheus
+                  prometheus.io/port: 15020
+                  prometheus.io/scrape: true
+                  sidecar.istio.io/status:
+                    {"initContainers":["istio-init","istio-proxy"],"containers":null,"volumes":["workload-socket","credential-socket","workload-certs","istio-...
+Status:           Failed
+IP:               10.8.7.28
+IPs:
+  IP:  10.8.7.28
+Init Containers:
+  istio-init:
+    Container ID:  containerd://0247cfdd3fe1898733a1465efb98184b89bf46fd815ba43ffb5042c2cf44f414
+    Image:         docker.io/istio/proxyv2:1.29.2-distroless
+    Image ID:      docker.io/istio/proxyv2@sha256:76a2d37889220940767aa578926ba590185ace83993c5aaa491eb3150c20aff7
+    Port:          <none>
+    Host Port:     <none>
+    Args:
+      istio-iptables
+      -p
+      15001
+      -z
+      15006
+      -u
+      1337
+      -m
+      REDIRECT
+      -i
+      *
+      -x
+      
+      -b
+      *
+      -d
+      15090,15021,15020
+      --log_output_level=default:info,delta:warn,ads:warn
+      --log_as_json
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Fri, 04 Sep 2026 15:01:28 +0330
+      Finished:     Fri, 04 Sep 2026 15:01:28 +0330
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:     2
+      memory:  1Gi
+    Requests:
+      cpu:     100m
+      memory:  128Mi
+    Environment:
+      ISTIO_META_ENABLE_HBONE:  true
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-k4q74 (ro)
+  istio-proxy:
+    Container ID:  containerd://63bda871685ef6cd9e8c15976afde209818c322a2bffd4a0f844cdfa4d4693a9
+    Image:         docker.io/istio/proxyv2:1.29.2-distroless
+    Image ID:      docker.io/istio/proxyv2@sha256:76a2d37889220940767aa578926ba590185ace83993c5aaa491eb3150c20aff7
+    Port:          15090/TCP (http-envoy-prom)
+    Host Port:     0/TCP (http-envoy-prom)
+    Args:
+      proxy
+      sidecar
+      --domain
+      $(POD_NAMESPACE).svc.cluster.local
+      --proxyLogLevel=info
+      --proxyComponentLogLevel=misc:error,upstream:warning
+      --log_output_level=default:info,delta:warn,ads:warn
+      --log_as_json
+      --outlierLogPath=/dev/stdout
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Fri, 04 Sep 2026 15:01:30 +0330
+      Finished:     Fri, 04 Sep 2026 15:01:36 +0330
+    Ready:          False
+    Restart Count:  0
+    Limits:
+      cpu:     2
+      memory:  1Gi
+    Requests:
+      cpu:      100m
+      memory:   128Mi
+    Readiness:  http-get http://:15021/healthz/ready delay=0s timeout=3s period=15s #success=1 #failure=4
+    Startup:    http-get http://:15021/healthz/ready delay=0s timeout=3s period=1s #success=1 #failure=600
+    Environment:
+      PILOT_CERT_PROVIDER:           istiod
+      CA_ADDR:                       istiod.istio-system.svc:15012
+      POD_NAME:                      knb-lat-client-tcprr-148478 (v1:metadata.name)
+      POD_NAMESPACE:                 benchmark-sidecar-mtls (v1:metadata.namespace)
+      INSTANCE_IP:                    (v1:status.podIP)
+      SERVICE_ACCOUNT:                (v1:spec.serviceAccountName)
+      HOST_IP:                        (v1:status.hostIP)
+      ISTIO_CPU_LIMIT:               2 (limits.cpu)
+      PROXY_CONFIG:                  {"proxyMetadata":{"ISTIO_META_ENABLE_HBONE":"true"},"meshId":"staging-mesh","image":{"imageType":"distroless"}}
+                                     
+      ISTIO_META_POD_PORTS:          [
+                                     ]
+      ISTIO_META_APP_CONTAINERS:     netperf
+      GOMEMLIMIT:                    1073741824 (limits.memory)
+      GOMAXPROCS:                    2 (limits.cpu)
+      ISTIO_META_CLUSTER_ID:         Kubernetes
+      ISTIO_META_NODE_NAME:           (v1:spec.nodeName)
+      ISTIO_META_INTERCEPTION_MODE:  REDIRECT
+      ISTIO_META_WORKLOAD_NAME:      knb-lat-client-tcprr-148478
+      ISTIO_META_OWNER:              kubernetes://apis/v1/namespaces/benchmark-sidecar-mtls/pods/knb-lat-client-tcprr-148478
+      ISTIO_META_MESH_ID:            staging-mesh
+      TRUST_DOMAIN:                  cluster.local
+      ISTIO_META_ENABLE_HBONE:       true
+    Mounts:
+      /etc/istio/pod from istio-podinfo (rw)
+      /etc/istio/proxy from istio-envoy (rw)
+      /var/lib/istio/data from istio-data (rw)
+      /var/run/secrets/credential-uds from credential-socket (rw)
+      /var/run/secrets/istio from istiod-ca-cert (rw)
+      /var/run/secrets/istio/crl from istio-ca-crl (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-k4q74 (ro)
+      /var/run/secrets/tokens from istio-token (rw)
+      /var/run/secrets/workload-spiffe-credentials from workload-certs (rw)
+      /var/run/secrets/workload-spiffe-uds from workload-socket (rw)
+Containers:
+  netperf:
+    Container ID:  containerd://fddd70815ad049d06077ba24f35fa4d59f68d99159aaa5605b1edb0d32cef6de
+    Image:         reg.production.tpsl.ir/docker-infra-local/infrastructure/knb/knb-netperf:0.0.1
+    Image ID:      reg.production.tpsl.ir/docker-infra-local/infrastructure/knb/knb-netperf@sha256:0747877399a77e46e2375fa87b00d947c85235ba9eaee6f56e3d91b6c8d78a13
+    Port:          <none>
+    Host Port:     <none>
+    Args:
+      /bin/sh
+      -c
+      netperf -H 10.8.9.16 -t TCP_RR -l 20 -- -r 1,1 -o MEAN_LATENCY,P50_LATENCY,P90_LATENCY,P99_LATENCY,MIN_LATENCY,MAX_LATENCY,STDDEV_LATENCY,THROUGHPUT,LOCAL_TRANSPORT_RETRANS,REMOTE_TRANSPORT_RETRANS
+    State:          Terminated
+      Reason:       Error
+      Exit Code:    1
+      Started:      Fri, 04 Sep 2026 15:01:35 +0330
+      Finished:     Fri, 04 Sep 2026 15:01:35 +0330
+    Ready:          False
+    Restart Count:  0
+    Environment:    <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-k4q74 (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   False 
+  Initialized                 True 
+  Ready                       False 
+  ContainersReady             False 
+  PodScheduled                True 
+Volumes:
+  workload-socket:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  credential-socket:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  workload-certs:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  istio-envoy:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     Memory
+    SizeLimit:  <unset>
+  istio-data:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  <unset>
+  istio-podinfo:
+    Type:  DownwardAPI (a volume populated by information about the pod)
+    Items:
+      metadata.labels -> labels
+      metadata.annotations -> annotations
+  istio-token:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  43200
+  istiod-ca-cert:
+    Type:      ConfigMap (a volume populated by a ConfigMap)
+    Name:      istio-ca-root-cert
+    Optional:  false
+  istio-ca-crl:
+    Type:      ConfigMap (a volume populated by a ConfigMap)
+    Name:      istio-ca-crl
+    Optional:  true
+  kube-api-access-k4q74:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=g9-56core-1228
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason     Age                    From               Message
+  ----     ------     ----                   ----               -------
+  Normal   Scheduled  2m29s                  default-scheduler  Successfully assigned benchmark-sidecar-mtls/knb-lat-client-tcprr-148478 to g9-56core-1228
+  Normal   Pulled     2m28s                  kubelet            Container image "docker.io/istio/proxyv2:1.29.2-distroless" already present on machine
+  Normal   Created    2m27s                  kubelet            Created container istio-init
+  Normal   Started    2m27s                  kubelet            Started container istio-init
+  Normal   Pulled     2m25s                  kubelet            Container image "docker.io/istio/proxyv2:1.29.2-distroless" already present on machine
+  Normal   Created    2m25s                  kubelet            Created container istio-proxy
+  Normal   Started    2m25s                  kubelet            Started container istio-proxy
+  Warning  Unhealthy  2m22s (x3 over 2m24s)  kubelet            Startup probe failed: Get "http://10.8.7.28:15021/healthz/ready": dial tcp 10.8.7.28:15021: connect: connection refused
+  Normal   Pulled     2m21s                  kubelet            Container image "reg.production.tpsl.ir/docker-infra-local/infrastructure/knb/knb-netperf:0.0.1" already present on machine
+  Normal   Created    2m21s                  kubelet            Created container netperf
+  Normal   Started    2m20s                  kubelet            Started container netperf
+  Normal   Killing    2m19s                  kubelet            Stopping container istio-proxy

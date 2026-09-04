@@ -1,0 +1,10 @@
+test=httpbw
+target=p2s
+bw_mbps=2492.4
+bw_size=65536
+rate=4741.0
+calls=94833
+client_cpu=19.36
+client_ram=131208
+server_cpu=29.74
+server_ram=138081
