@@ -4,7 +4,7 @@
 
 # --- nodes -------------------------------------------------------
 # The client node hosts the load generators, the server node the targets.
-CLIENT_NODE="${CLIENT_NODE:-g9-56core-1227}"
+CLIENT_NODE="${CLIENT_NODE:-g9-56core-1228}"
 SERVER_NODE="${SERVER_NODE:-g9-56core-1229}"
 CONTEXT="${CONTEXT:-stg}"
 
